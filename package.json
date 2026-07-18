@@ -1,0 +1,18 @@
+{
+  "name": "hottodigital-assistant",
+  "version": "0.1.0",
+  "description": "Asistente virtual de WhatsApp para Hotto - reservas y pedidos con IA",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "openai": "^4.77.0"
+  }
+}
