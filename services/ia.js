@@ -1,12 +1,9 @@
-const OpenAI = require("openai");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai");
 
 const reservas = require("./reservas");
 const pedidos = require("./pedidos");
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const SYSTEM_PROMPT = `
 Eres el asistente virtual de WhatsApp de ${process.env.RESTAURANT_NAME || "el restaurante"}.
@@ -25,52 +22,58 @@ Reglas importantes:
 
 const tools = [
   {
-    type: "function",
-    function: {
-      name: "crearReserva",
-      description: "Crea una reserva de mesa para el cliente.",
-      parameters: {
-        type: "object",
-        properties: {
-          nombre: { type: "string" },
-          fecha: { type: "string", description: "Formato YYYY-MM-DD" },
-          hora: { type: "string", description: "Formato HH:mm, 24h" },
-          personas: { type: "integer" },
-          notas: { type: "string" },
-        },
-        required: ["nombre", "fecha", "hora", "personas"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "crearPedido",
-      description:
-        "Registra un pedido del cliente. Queda pendiente de confirmación humana, no se envía a cocina automáticamente.",
-      parameters: {
-        type: "object",
-        properties: {
-          nombreCliente: { type: "string" },
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                producto: { type: "string" },
-                cantidad: { type: "integer" },
-                notas: { type: "string" },
-              },
-              required: ["producto", "cantidad"],
-            },
+    functionDeclarations: [
+      {
+        name: "crearReserva",
+        description: "Crea una reserva de mesa para el cliente.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            nombre: { type: SchemaType.STRING },
+            fecha: { type: SchemaType.STRING, description: "Formato YYYY-MM-DD" },
+            hora: { type: SchemaType.STRING, description: "Formato HH:mm, 24h" },
+            personas: { type: SchemaType.INTEGER },
+            notas: { type: SchemaType.STRING },
           },
-          notas: { type: "string" },
+          required: ["nombre", "fecha", "hora", "personas"],
         },
-        required: ["items"],
       },
-    },
+      {
+        name: "crearPedido",
+        description:
+          "Registra un pedido del cliente. Queda pendiente de confirmación humana, no se envía a cocina automáticamente.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            nombreCliente: { type: SchemaType.STRING },
+            items: {
+              type: SchemaType.ARRAY,
+              items: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  producto: { type: SchemaType.STRING },
+                  cantidad: { type: SchemaType.INTEGER },
+                  notas: { type: SchemaType.STRING },
+                },
+                required: ["producto", "cantidad"],
+              },
+            },
+            notas: { type: SchemaType.STRING },
+          },
+          required: ["items"],
+        },
+      },
+    ],
   },
 ];
+
+function getModel() {
+  return genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+    systemInstruction: SYSTEM_PROMPT,
+    tools,
+  });
+}
 
 async function ejecutarHerramienta(nombre, args, telefonoCliente) {
   if (nombre === "crearReserva") {
@@ -90,74 +93,53 @@ async function ejecutarHerramienta(nombre, args, telefonoCliente) {
   return { ok: false, error: "Herramienta no reconocida" };
 }
 
+/** Convierte el historial guardado ({role: "user"|"assistant", content}) al formato de Gemini */
+function convertirHistorial(historial) {
+  return historial.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+}
+
 /**
- * Transcribe audio (notas de voz de WhatsApp) usando Whisper.
- * buffer: Buffer de audio, mimeType: p.ej. "audio/ogg; codecs=opus"
+ * Transcribe una nota de voz de WhatsApp usando Gemini directamente
+ * (Gemini acepta audio como entrada, no hace falta un servicio aparte tipo Whisper).
  */
 async function transcribirAudio(buffer, mimeType) {
-  const ext = mimeType.includes("ogg") ? "ogg" : "mp3";
-  const tmpPath = path.join(os.tmpdir(), `audio_${Date.now()}.${ext}`);
-  fs.writeFileSync(tmpPath, buffer);
-
-  try {
-    const res = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(tmpPath),
-      model: "whisper-1",
-      language: "es",
-    });
-    return res.text;
-  } finally {
-    fs.unlinkSync(tmpPath);
-  }
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const result = await model.generateContent([
+    { inlineData: { data: buffer.toString("base64"), mimeType } },
+    { text: "Transcribe este audio a texto en español. Devuelve solo la transcripción, sin comentarios ni explicaciones." },
+  ]);
+  return result.response.text().trim();
 }
 
 /**
  * Procesa un mensaje de texto (ya transcrito si venía de audio) y devuelve
  * la respuesta final en texto para enviar por WhatsApp.
- * historial: array de mensajes previos [{role, content}] para dar contexto.
  */
 async function procesarMensaje(textoUsuario, telefonoCliente, historial = []) {
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...historial,
-    { role: "user", content: textoUsuario },
-  ];
+  const model = getModel();
+  const chat = model.startChat({ history: convertirHistorial(historial) });
 
-  let response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages,
-    tools,
-  });
+  let result = await chat.sendMessage(textoUsuario);
+  let response = result.response;
+  let calls = response.functionCalls();
 
-  let choice = response.choices[0];
-
-  // Si el modelo quiere usar una herramienta, la ejecutamos y le devolvemos el resultado
-  while (choice.finish_reason === "tool_calls") {
-    messages.push(choice.message);
-
-    for (const toolCall of choice.message.tool_calls) {
-      const args = JSON.parse(toolCall.function.arguments);
-      const resultado = await ejecutarHerramienta(
-        toolCall.function.name,
-        args,
-        telefonoCliente
-      );
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(resultado),
+  while (calls && calls.length > 0) {
+    const respuestasFuncion = [];
+    for (const call of calls) {
+      const resultado = await ejecutarHerramienta(call.name, call.args, telefonoCliente);
+      respuestasFuncion.push({
+        functionResponse: { name: call.name, response: resultado },
       });
     }
-
-    response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages,
-      tools,
-    });
-    choice = response.choices[0];
+    result = await chat.sendMessage(respuestasFuncion);
+    response = result.response;
+    calls = response.functionCalls();
   }
 
-  return choice.message.content;
+  return response.text();
 }
 
 module.exports = { procesarMensaje, transcribirAudio };
